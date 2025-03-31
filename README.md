@@ -22,7 +22,7 @@ Odyssey is a curated repository containing a comprehensive collection of PowerSh
 
 1. **Clone the Repository:**
 ```bash
-git clone https://github.com/yourusername/Odyssey.git
+git clone https://github.com/redkeysh/odyssey.git
 ```
 
 2.  **Navigate to the Repository:**
@@ -42,11 +42,11 @@ cd Odyssey
 
 ## How to Contribute
 
-Contributions are welcome! Please read the CONTRIBUTING.md file for guidelines on how to contribute.
+Contributions are welcome! Please read the [CONTRIBUTING](CONTRIBUTING.md) file for guidelines on how to contribute.
 
 ## License
 
-This project is licensed under the MIT License – see the LICENSE file for details.
+This project is licensed under the MIT License – see the [LICENSE](LICENSE) file for details.
 
 ## Contact
 
