@@ -33,7 +33,6 @@ if($expectedName -eq $actualName) {
 } else {
     $wshell = New-Object -ComObject Wscript.Shell
     $wshell.Popup("WARNING! The computer name doesn't match the shipboard naming scheme!`n`nActual Name: $($actualName)`n`nExpected Name: $($expectedName)",0,"Warning",0x1)
-    #Write-Output "WARNING! The computer name doesn't match the shipboard naming scheme!`n`nActual Name: $($actualName)`n`nExpected Name: $($expectedName)"
 }
 
 ###
