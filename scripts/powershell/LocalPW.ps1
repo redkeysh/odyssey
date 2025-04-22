@@ -15,7 +15,7 @@ If (-NOT ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdent
 
 
 $username = "<change_me>"
-$encrypted = "<pre-encrpted-string>"
+$encrypted = "<pre-encrypted-string>"
 $password = ConvertTo-SecureString $encrypted 
 
 # Get the local user account
