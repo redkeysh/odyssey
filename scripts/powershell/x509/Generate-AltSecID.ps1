@@ -1,172 +1,261 @@
-# Clear the screen for easier reading.
-cls
+<#
+.SYNOPSIS
+    Updates AD users’ altSecurityIdentities based on Client Authentication certificates in the current user store.
 
-# Import ActiveDirectory to interface with AttributeEditor.
-Import-Module ActiveDirectory
+.DESCRIPTION
+    - Enumerates personal certificates whose Enhanced Key Usage includes Client Authentication.
+    - Converts each certificate’s serial number into a reversed hex string.
+    - Formats an X.509 issuer string suitable for the AD altSecurityIdentities attribute.
+    - Extracts a “first.last” user identity from the certificate subject.
+    - Prompts to select certificates by index and updates the corresponding AD user(s) on the specified domain controller.
 
-function MakeHex-String {
-    param (
-        [Parameter(Mandatory = $true)]
-        [string]$HexString
-    )
-    
-    $cleanHex = $HexString.Replace(" ", "") # Remove any spaces from the input string.
-    if ($cleanHex.Length % 2 -ne 0) {
-        Write-Warning "Hex string does not have an even number of characters. Aborting conversion."
-        return $null
-    }
+.NOTES
+    Author: redkeysh
+    Date  : 2025-04-22
+#>
 
-    # Split the string into two-character groups.
-    $bytePairs = @()
-    for ($i = 0; $i -lt $cleanHex.Length; $i += 2) {
-        $bytePairs += $cleanHex.Substring($i, 2)
-    }
-
-    # Reverse the array in place.
-    $reversedBytePairs = $bytePairs.Clone()
-    [Array]::Reverse($reversedBytePairs)
-    return ($reversedBytePairs -join "")
+#region Module Import
+Try {
+    Import-Module ActiveDirectory -ErrorAction Stop
+    Write-Verbose "ActiveDirectory module imported successfully."
 }
-
-# Function to generate a formatted X509 issuer string for AD altSecurityIdentities.
-function Format-X509Issuer {
-    param (
-        [Parameter(Mandatory = $true)]
-        [string]$IssuerString,
-        [Parameter(Mandatory = $false)]
-        [string]$ReversedSerialNumber = ""
-    )
-
-    # Split the issuer string by commas and trim spaces.
-    $parts = $IssuerString.Split(",") | ForEach-Object { $_.Trim() }
-    $partsClone = $parts.Clone()
-    [Array]::Reverse($partsClone)
-    $reversedIssuer = $partsClone -join ","
-    
-    $result = "X509:<I>$reversedIssuer"
-    if ($ReversedSerialNumber -ne "") {
-        $result += "<SR>$ReversedSerialNumber"
-    }
-    return $result
+Catch {
+    Write-Error "Failed to import ActiveDirectory module: $_"
+    Exit 1
 }
+#endregion
 
-# Function to extract user identity in "first.last" format from a certificate subject.
-function Get-UserIdentityFromSubject {
+#region Helper Functions
+
+function ConvertTo-ReversedHexString {
+    <#
+    .SYNOPSIS
+        Reverses the byte order of a hexadecimal string.
+
+    .PARAMETER HexString
+        A space-delimited or contiguous hex string (e.g. "00 A1 FF" or "00A1FF").
+
+    .OUTPUTS
+        [string]  Two-character hex byte pairs in reverse order (e.g. "FFA100").
+
+    .NOTES
+        Returns $null if the input length is not even.
+    #>
     [CmdletBinding()]
     param (
-        [Parameter(Mandatory = $true)]
+        [Parameter(Mandatory, ValueFromPipeline)]
+        [ValidateNotNullOrEmpty()]
+        [string]$HexString
+    )
+
+    $cleanHex = $HexString -Replace '\s',''
+    if ($cleanHex.Length % 2) {
+        Write-Warning "Input hex string must contain an even number of characters."
+        return $null
+    }
+
+    $bytes = for ($i = 0; $i -lt $cleanHex.Length; $i += 2) {
+        $cleanHex.Substring($i, 2)
+    }
+
+    [Array]::Reverse($bytes)
+    return ($bytes -join '')
+}
+
+function Format-AltSecurityIdentity {
+    <#
+    .SYNOPSIS
+        Builds an X509 altSecurityIdentities value for AD.
+
+    .PARAMETER Issuer
+        The certificate issuer distinguished name.
+
+    .PARAMETER ReversedSerial
+        The reversed-hex serial number (optional).
+
+    .OUTPUTS
+        [string]  Formatted X509 altSecurityIdentities entry.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Issuer,
+
+        [Parameter()]
+        [string]$ReversedSerial = ''
+    )
+
+    # Reverse the RDN sequence of the issuer
+    $rdns = $Issuer -Split ',' | ForEach-Object { $_.Trim() }
+    [Array]::Reverse($rdns)
+    $reversedIssuer = $rdns -join ','
+
+    $entry = "X509:<I>$reversedIssuer"
+    if ($ReversedSerial) {
+        $entry += "<SR>$ReversedSerial"
+    }
+
+    return $entry
+}
+
+function Get-UserIdentityFromCertSubject {
+    <#
+    .SYNOPSIS
+        Extracts a “first.last” identity from a certificate subject’s CN.
+
+    .PARAMETER Subject
+        The certificate subject distinguished name.
+
+    .OUTPUTS
+        [string]  Username in first.last format, or $null on failure.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
         [string]$Subject
     )
-    
-    $subjectParts = $Subject -split "," | ForEach-Object { $_.Trim() }
-    $cnPart = $subjectParts | Where-Object { $_ -like "CN=*" } | Select-Object -First 1
 
-    if (-not $cnPart) {
-        Write-Warning "No CN found in subject."
-        return $null
-    }
-    
-    $cnValue = $cnPart -replace "^CN=", ""
-    $nameParts = $cnValue -split "\."
+    # Find the CN component
+    $cn = ($Subject -Split ',' |
+           ForEach-Object { $_.Trim() } |
+           Where-Object { $_ -like 'CN=*' } |
+           Select-Object -First 1) -Replace '^CN=', ''
 
-    if ($nameParts.Count -lt 2) {
-        Write-Warning "Unexpected CN format. Expected at least two dot-delimited parts."
+    if (-not $cn) {
+        Write-Warning "Certificate subject does not contain a CN component."
         return $null
     }
 
-    # Assume CN is "last.first[.more]" and convert it to "first.last".
-    $userIdentity = "$($nameParts[1]).$($nameParts[0])"
-    return $userIdentity
+    $parts = $cn -Split '\.'
+    if ($parts.Count -lt 2) {
+        Write-Warning "Unexpected CN format '$cn'. Expected at least 'Last.First'."
+        return $null
+    }
+
+    # Convert Last.First to First.Last
+    return "$($parts[1]).$($parts[0])"
 }
 
-# Function to filter certificates that have Client Authentication as an intended usage
 function Get-ClientAuthCertificates {
-    $store = Get-ChildItem -Path Cert:\CurrentUser\My
+    <#
+    .SYNOPSIS
+        Retrieves user certificates with Client Authentication EKU.
 
-    $certList = @()
-    foreach ($cert in $store) {
-        $clientAuthFound = $cert.EnhancedKeyUsageList |
-            Where-Object { ($_.FriendlyName -match "Client Authentication") -or ($_.Value -eq "1.3.6.1.5.5.7.3.2") }
+    .OUTPUTS
+        [pscustomobject[]]  Collection of certificate data objects.
+    #>
+    [CmdletBinding()]
+    param ()
 
-        if ($clientAuthFound) {
-            # Retrieve and reverse the serial number
-            $serialNumber = $cert.GetSerialNumberString()
-            $reversedSerial = Reverse-HexBytes -HexString $serialNumber
-            
-            # Format the X509 string using the issuer
-            $formatted = Format-X509Issuer -IssuerString $cert.Issuer -ReversedSerialNumber $reversedSerial
-            
-            # Extract a "user identity" from the certificate's subject
-            $userIdentity = Get-UserIdentityFromSubject -Subject $cert.Subject
-            
-            # Add to list as a custom object
-            $certList += [pscustomobject]@{
-                Index             = $certList.Count + 1
+    $certs = Get-ChildItem -Path Cert:\CurrentUser\My
+    $results = [System.Collections.Generic.List[psobject]]::new()
+
+    foreach ($cert in $certs) {
+        if ($cert.EnhancedKeyUsageList.FriendlyName -contains 'Client Authentication' -or
+            $cert.EnhancedKeyUsageList.Value -contains '1.3.6.1.5.5.7.3.2') {
+
+            $serial        = $cert.GetSerialNumberString()
+            $revSerial     = ConvertTo-ReversedHexString -HexString $serial
+            $altSecId      = Format-AltSecurityIdentity -Issuer $cert.Issuer -ReversedSerial $revSerial
+            $userId        = Get-UserIdentityFromCertSubject -Subject $cert.Subject
+
+            $results.Add([pscustomobject]@{
+                Index             = $results.Count + 1
                 Subject           = $cert.Subject
                 Issuer            = $cert.Issuer
-                SerialNumber      = $serialNumber
-                ReversedSerial    = $reversedSerial
-                FormattedAltSecId = $formatted
-                UserIdentity      = $userIdentity
-            }
+                SerialNumber      = $serial
+                ReversedSerial    = $revSerial
+                AltSecurityId     = $altSecId
+                UserIdentity      = $userId
+            })
         }
     }
-    return $certList
+
+    return $results
 }
 
-# Function to update AD User's altSecurityIdentities field on a specified Domain Controller.
-function Update-ADUserAltSecId {
+function Update-ADUserAltSecurityIdentity {
+    <#
+    .SYNOPSIS
+        Updates a user’s altSecurityIdentities in AD.
+
+    .PARAMETER UserIdentity
+        The sAMAccountName or distinguished name of the user.
+
+    .PARAMETER AltSecurityId
+        The formatted altSecurityIdentities string.
+
+    .PARAMETER DomainController
+        The domain controller to target.
+    #>
+    [CmdletBinding()]
     param (
-        [Parameter(Mandatory = $true)]
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
         [string]$UserIdentity,
-        [Parameter(Mandatory = $true)]
-        [string]$FormattedAltSecId,
-        [Parameter(Mandatory = $true)]
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$AltSecurityId,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
         [string]$DomainController
     )
-    # Update the altSecurityIdentities for the user.
+
     try {
-        Set-ADUser -Identity $UserIdentity -Replace @{altSecurityIdentities=@($FormattedAltSecId)} -Server $DomainController
-        Write-Host "Updated user '$UserIdentity' with altSecurityIdentities: $FormattedAltSecId" -ForegroundColor Green
-    } catch {
-        Write-Host "Failed to update user '$UserIdentity'. Error: $_" -ForegroundColor Red
+        Set-ADUser -Identity $UserIdentity `
+                   -Replace @{ altSecurityIdentities = @($AltSecurityId) } `
+                   -Server $DomainController -ErrorAction Stop
+        Write-Verbose "Updated '$UserIdentity' with altSecurityIdentities '$AltSecurityId'."
+    }
+    catch {
+        Write-Warning "Failed to update '$UserIdentity': $_"
     }
 }
+#endregion
 
-##############################################
-# MAIN SCRIPT LOGIC
-##############################################
+#region Main
 
-# Choose the Domain Controller to use. You can hard-code or prompt for one.
-$domainController = Read-Host
+# Prompt the administrator for the target Domain Controller. Retry with empty input.
+do {
+    $domainController = Read-Host -Prompt 'Enter the Domain Controller FQDN (e.g. dc01.corp.contoso.com)'
+    if ([string]::IsNullOrWhiteSpace($domainController)) {
+        Write-Warning 'Domain Controller cannot be blank. Please enter a valid FQDN.'
+    }
+} while ([string]::IsNullOrWhiteSpace($domainController))
 
-# Get all valid certificates with Client Authentication EKU.
-$clientCerts = Get-ClientAuthCertificates
-
-if ($clientCerts.Count -eq 0) {
-    Write-Host "No applicable Client Authentication certificates found in your personal store." -ForegroundColor Yellow
-    Exit
+# Retrieve and display eligible certificates
+$certList = Get-ClientAuthCertificates
+if (-not $certList) {
+    Write-Warning 'No Client Authentication certificates found in the current user store.'
+    Exit 0
 }
 
-# Display the retrieved certificates in a table.
-Write-Host "The following certificates were found:" -ForegroundColor Cyan
-$clientCerts | Format-Table Index, UserIdentity, Subject, SerialNumber
+Write-Host 'Available Client Authentication Certificates:' -ForegroundColor Cyan
+$certList | Format-Table Index, UserIdentity, Subject, SerialNumber
 
-# Interactive mode: ask for certificate index number(s)
-$selection = Read-Host "Enter a comma-separated list of certificate index numbers to update"
-$selectedIndexes = $selection -split "\s*,\s*" | ForEach-Object { [int]$_ }
-        
-foreach ($index in $selectedIndexes) {
-    $certEntry = $clientCerts | Where-Object { $_.Index -eq $index }
-    if ($certEntry -ne $null) {
-        if (-not $certEntry.UserIdentity) {
-            Write-Host "Unable to determine user identity for certificate index $index; skipping." -ForegroundColor Yellow
-            continue
-        }
-        Update-ADUserAltSecId -UserIdentity $certEntry.UserIdentity -FormattedAltSecId $certEntry.FormattedAltSecId -DomainController $domainController
+# Select certificates to process
+$selection = Read-Host -Prompt 'Enter comma-separated certificate index(es) to update'
+$indexes   = $selection -Split '\s*,\s*' | ForEach-Object { [int]$_ } | Where-Object { $_ -gt 0 }
+
+foreach ($i in $indexes) {
+    $entry = $certList | Where-Object { $_.Index -eq $i }
+    if ($null -eq $entry) {
+        Write-Warning "Index $i is not valid; skipping."
+        continue
     }
-    else {
-        Write-Host "No certificate found with index $index." -ForegroundColor Red
+    if (-not $entry.UserIdentity) {
+        Write-Warning "Cannot determine user identity for index $i; skipping."
+        continue
     }
-        
+
+    Update-ADUserAltSecurityIdentity `
+        -UserIdentity   $entry.UserIdentity `
+        -AltSecurityId  $entry.AltSecurityId `
+        -DomainController $domainController
 }
+
+#endregion
